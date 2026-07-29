@@ -1,7 +1,7 @@
 id: h_ball_balance
 name: H Ball Balance
 name[zh]: H题滚球控制
-version: 1.0.4
+version: 1.0.5
 author: team
 desc: Single-ball position measurement, UART telemetry and RTSP monitoring for problem H
 icon: ""

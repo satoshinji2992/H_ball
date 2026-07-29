@@ -30,7 +30,9 @@ constexpr int STREAM_H = 480;
 constexpr int CAMERA_FPS = 30;
 constexpr uint64_t UI_UPDATE_INTERVAL_MS = 100;
 constexpr size_t VISION_FRAME_SIZE = 11;
-constexpr uint64_t MAX_PREDICTION_MS = 100;
+constexpr uint64_t CAMERA_HALF_FRAME_MS = 1000 / CAMERA_FPS / 2;
+constexpr uint64_t MAX_LATENCY_COMPENSATION_MS = 100;
+constexpr uint64_t MAX_MISSING_PREDICTION_MS = 100;
 constexpr float THREE_POINT_POSITION_TOLERANCE_CM = 0.3F;
 constexpr float THREE_POINT_VELOCITY_TOLERANCE_CM_S = 2.0F;
 constexpr uint64_t THREE_POINT_STABLE_MS = 500;
@@ -70,7 +72,7 @@ struct Estimate {
 static Estimate extrapolate_estimate(const Estimate &estimate, uint64_t delay_ms) {
     if (!estimate.valid) return estimate;
     Estimate predicted = estimate;
-    const uint64_t bounded_delay_ms = std::min(delay_ms, MAX_PREDICTION_MS);
+    const uint64_t bounded_delay_ms = std::min(delay_ms, MAX_LATENCY_COMPENSATION_MS);
     predicted.position_cm += predicted.velocity_cm_s *
                              static_cast<float>(bounded_delay_ms) * 0.001F;
     return predicted;
@@ -85,7 +87,6 @@ public:
     }
 
     float target_cm() const { return TARGETS_CM[phase_]; }
-    int phase_number() const { return static_cast<int>(phase_) + 1; }
     bool complete() const { return complete_; }
 
     void update(const Estimate &estimate, uint64_t now_ms) {
@@ -112,7 +113,9 @@ public:
     }
 
 private:
-    static constexpr std::array<float, 3> TARGETS_CM{0.0F, 5.0F, -5.0F};
+    // The ball is held at O while waiting for START. The active sequence then
+    // moves directly to +5 cm and finally -5 cm.
+    static constexpr std::array<float, 2> TARGETS_CM{5.0F, -5.0F};
     size_t phase_ = 0;
     uint64_t stable_since_ms_ = 0;
     bool complete_ = false;
@@ -178,7 +181,7 @@ class PositionFilter {
 public:
     Estimate update(bool measured, cv::Point2f center, float position, float score, uint64_t now_ms) {
         if (!measured) {
-            if (initialized_ && now_ms - last_seen_ms_ <= 250) {
+            if (initialized_ && now_ms - last_seen_ms_ <= MAX_MISSING_PREDICTION_MS) {
                 position_ += velocity_ * static_cast<float>(now_ms - last_ms_) * 0.001F;
                 last_ms_ = now_ms;
                 return {true, last_center_, position_, velocity_, 0.0F};
@@ -296,8 +299,10 @@ int app_main(int argc, char **argv) {
     const image::Format detector_format = detector.input_format();
 
     camera::Camera stream_camera(STREAM_W, STREAM_H, image::FMT_YVU420SP, nullptr, CAMERA_FPS, 3);
+    // A single detector buffer avoids processing queued, stale frames. The
+    // RTSP channel keeps its own buffers and is not affected.
     std::unique_ptr<camera::Camera> camera(
-        stream_camera.add_channel(CAM_W, CAM_H, detector_format, CAMERA_FPS, 3));
+        stream_camera.add_channel(CAM_W, CAM_H, detector_format, CAMERA_FPS, 1));
     err::check_null_raise(camera.get(), "failed to create detector channel");
     display::Display display;
     touchscreen::TouchScreen touch;
@@ -316,10 +321,12 @@ int app_main(int argc, char **argv) {
     const Button mode_b{112, 202, 61, 34, "MODE"};
     const Button target_down{176, 202, 37, 34, "T-"};
     const Button target_up{216, 202, 37, 34, "T+"};
+    const Button start_b{256, 202, 60, 34, "START"};
     const Button exit_b{258, 4, 58, 36, "EXIT"};
     BallMode mode = BallMode::CENTER_BALANCE;
     float target_cm = 0.0F;
     float fixed_target_cm = 0.0F;
+    bool three_point_running = false;
     bool prev_pressed = false;
     PositionFilter filter;
     ThreePointSequence three_point;
@@ -329,18 +336,21 @@ int app_main(int argc, char **argv) {
     uint32_t fps_frame_count = 0;
 
     while (!app::need_exit()) {
-        const uint64_t now = time::ticks_ms();
         std::unique_ptr<image::Image> frame(camera->read());
         if (!frame) continue;
+        const uint64_t capture_done_ms = time::ticks_ms();
+        const uint64_t measurement_ms = capture_done_ms >= CAMERA_HALF_FRAME_MS
+                                      ? capture_done_ms - CAMERA_HALF_FRAME_MS : 0;
         std::unique_ptr<nn::Objects> objects(
             detector.detect(*frame, cfg.confidence, cfg.iou, image::FIT_CONTAIN));
         if (!objects) continue;
         const nn::Object *ball = select_ball(*objects, cfg);
         if (ball) {
             const cv::Point2f center(ball->x + ball->w * 0.5F, ball->y + ball->h * 0.5F);
-            estimate = filter.update(true, center, point_to_cm(center, cfg), ball->score, now);
+            estimate = filter.update(true, center, point_to_cm(center, cfg), ball->score,
+                                     measurement_ms);
         } else {
-            estimate = filter.update(false, {}, 0.0F, 0.0F, now);
+            estimate = filter.update(false, {}, 0.0F, 0.0F, measurement_ms);
         }
 
         int tx = 0, ty = 0;
@@ -364,30 +374,40 @@ int app_main(int argc, char **argv) {
                     mode = static_cast<BallMode>((static_cast<int>(mode) + 1) % 3);
                     if (mode == BallMode::THREE_POINT) {
                         three_point.reset();
-                        target_cm = three_point.target_cm();
-                        log::info("3-POINT sequence started at %+.1fcm", target_cm);
+                        three_point_running = false;
+                        target_cm = 0.0F;
+                        log::info("3-POINT armed; touch START to begin");
                     } else if (mode == BallMode::CENTER_BALANCE) {
+                        three_point_running = false;
                         target_cm = 0.0F;
                     } else {
+                        three_point_running = false;
                         target_cm = fixed_target_cm;
                     }
                 } else if (inside(target_down, x, y)) {
                     fixed_target_cm = std::max(-10.0F, fixed_target_cm - 0.5F);
                     target_cm = fixed_target_cm;
                     mode = BallMode::FIXED_POINT;
+                    three_point_running = false;
                 } else if (inside(target_up, x, y)) {
                     fixed_target_cm = std::min(10.0F, fixed_target_cm + 0.5F);
                     target_cm = fixed_target_cm;
                     mode = BallMode::FIXED_POINT;
+                    three_point_running = false;
+                } else if (inside(start_b, x, y) && mode == BallMode::THREE_POINT) {
+                    three_point.reset();
+                    three_point_running = true;
+                    target_cm = three_point.target_cm();
+                    log::info("3-POINT started; target %+.1fcm", target_cm);
                 }
             }
             prev_pressed = pressed;
         }
 
         const uint64_t send_ms = time::ticks_ms();
-        const uint64_t processing_delay_ms = send_ms >= now ? send_ms - now : 0;
-        Estimate control_estimate = extrapolate_estimate(estimate, processing_delay_ms);
-        if (mode == BallMode::THREE_POINT) {
+        const uint64_t measurement_age_ms = send_ms >= measurement_ms ? send_ms - measurement_ms : 0;
+        Estimate control_estimate = extrapolate_estimate(estimate, measurement_age_ms);
+        if (mode == BallMode::THREE_POINT && three_point_running) {
             three_point.update(control_estimate, send_ms);
             target_cm = three_point.target_cm();
         }
@@ -412,21 +432,27 @@ int app_main(int argc, char **argv) {
             }
             char mode_status[24] = {};
             if (mode == BallMode::THREE_POINT) {
-                std::snprintf(mode_status, sizeof(mode_status), "3PT%d%s",
-                              three_point.phase_number(), three_point.complete() ? "-DONE" : "");
+                if (!three_point_running) {
+                    std::snprintf(mode_status, sizeof(mode_status), "3PT-WAIT");
+                } else {
+                    std::snprintf(mode_status, sizeof(mode_status), "3PT%+.0f%s",
+                                  target_cm, three_point.complete() ? "-DONE" : "");
+                }
             } else {
                 std::snprintf(mode_status, sizeof(mode_status), "%s", mode_name(mode));
             }
             char status[160];
             std::snprintf(status, sizeof(status), "%s x:%+.2f v:%+.1f T:%+.1f L:%llums",
                           mode_status, control_estimate.position_cm, control_estimate.velocity_cm_s,
-                          target_cm, static_cast<unsigned long long>(processing_delay_ms));
+                          target_cm, static_cast<unsigned long long>(measurement_age_ms));
             frame->draw_string(4, 4, status, valid_color, 1.0F);
             draw_button(*frame, cal_l, image::COLOR_YELLOW);
             draw_button(*frame, cal_r, image::COLOR_YELLOW);
             draw_button(*frame, mode_b, image::COLOR_GREEN);
             draw_button(*frame, target_down, image::COLOR_BLUE);
             draw_button(*frame, target_up, image::COLOR_BLUE);
+            draw_button(*frame, start_b, mode == BallMode::THREE_POINT
+                                            ? image::COLOR_GREEN : image::COLOR_GRAY);
             draw_button(*frame, exit_b, image::COLOR_RED);
 
             std::unique_ptr<image::Image> overlay(overlay_region->get_canvas());
