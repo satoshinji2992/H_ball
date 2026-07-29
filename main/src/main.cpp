@@ -15,12 +15,9 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
-#include <limits>
 #include <memory>
 #include <sstream>
 #include <string>
-#include <type_traits>
-#include <vector>
 
 using namespace maix;
 
@@ -30,17 +27,18 @@ constexpr int CAM_W = 320;
 constexpr int CAM_H = 240;
 constexpr int STREAM_W = 640;
 constexpr int STREAM_H = 480;
-constexpr int STREAM_FPS = 20;
-constexpr uint8_t FRAME_HEAD_0 = 0xAA;
-constexpr uint8_t FRAME_HEAD_1 = 0xBB;
-constexpr uint8_t FRAME_DATA_SIZE = 0x10;
+constexpr int CAMERA_FPS = 30;
+constexpr uint64_t UI_UPDATE_INTERVAL_MS = 100;
+constexpr size_t VISION_FRAME_SIZE = 11;
+constexpr uint64_t MAX_PREDICTION_MS = 100;
+constexpr float THREE_POINT_POSITION_TOLERANCE_CM = 0.3F;
+constexpr float THREE_POINT_VELOCITY_TOLERANCE_CM_S = 2.0F;
+constexpr uint64_t THREE_POINT_STABLE_MS = 500;
 
-enum class TestMode : uint8_t {
-    MONITOR = 0,
-    STATIC_SWEEP = 1,
-    AB_CENTER = 2,
-    LAP_CENTER = 3,
-    LAP_CUSTOM = 4,
+enum class BallMode : uint8_t {
+    CENTER_BALANCE = 0,
+    THREE_POINT = 1,
+    FIXED_POINT = 2,
 };
 
 struct Config {
@@ -69,20 +67,56 @@ struct Estimate {
     float score = 0.0F;
 };
 
-template <typename T>
-static void append_le(std::vector<uint8_t> &out, T value) {
-    static_assert(std::is_integral<T>::value, "integral type required");
-    using U = typename std::make_unsigned<T>::type;
-    U v = static_cast<U>(value);
-    for (size_t i = 0; i < sizeof(T); ++i) out.push_back(static_cast<uint8_t>(v >> (8 * i)));
+static Estimate extrapolate_estimate(const Estimate &estimate, uint64_t delay_ms) {
+    if (!estimate.valid) return estimate;
+    Estimate predicted = estimate;
+    const uint64_t bounded_delay_ms = std::min(delay_ms, MAX_PREDICTION_MS);
+    predicted.position_cm += predicted.velocity_cm_s *
+                             static_cast<float>(bounded_delay_ms) * 0.001F;
+    return predicted;
 }
 
-static void append_double_le(std::vector<uint8_t> &out, double value) {
-    static_assert(sizeof(double) == sizeof(uint64_t), "64-bit IEEE-754 double required");
-    uint64_t bits = 0;
-    std::memcpy(&bits, &value, sizeof(bits));
-    append_le<uint64_t>(out, bits);
-}
+class ThreePointSequence {
+public:
+    void reset() {
+        phase_ = 0;
+        stable_since_ms_ = 0;
+        complete_ = false;
+    }
+
+    float target_cm() const { return TARGETS_CM[phase_]; }
+    int phase_number() const { return static_cast<int>(phase_) + 1; }
+    bool complete() const { return complete_; }
+
+    void update(const Estimate &estimate, uint64_t now_ms) {
+        if (complete_ || !estimate.valid || estimate.score <= 0.0F ||
+            std::abs(target_cm() - estimate.position_cm) > THREE_POINT_POSITION_TOLERANCE_CM ||
+            std::abs(estimate.velocity_cm_s) > THREE_POINT_VELOCITY_TOLERANCE_CM_S) {
+            stable_since_ms_ = 0;
+            return;
+        }
+        if (stable_since_ms_ == 0) {
+            stable_since_ms_ = now_ms;
+            return;
+        }
+        if (now_ms - stable_since_ms_ < THREE_POINT_STABLE_MS) return;
+
+        stable_since_ms_ = 0;
+        if (phase_ + 1 < TARGETS_CM.size()) {
+            ++phase_;
+            log::info("3-POINT target advanced to %+.1fcm", target_cm());
+        } else {
+            complete_ = true;
+            log::info("3-POINT sequence complete");
+        }
+    }
+
+private:
+    static constexpr std::array<float, 3> TARGETS_CM{0.0F, 5.0F, -5.0F};
+    size_t phase_ = 0;
+    uint64_t stable_since_ms_ = 0;
+    bool complete_ = false;
+};
 
 static Config load_config(const std::string &path) {
     Config cfg;
@@ -131,13 +165,11 @@ static void draw_button(image::Image &img, const Button &b, const image::Color &
     img.draw_string(b.x + 4, b.y + 7, b.text, color, 0.8F);
 }
 
-static const char *mode_name(TestMode mode) {
+static const char *mode_name(BallMode mode) {
     switch (mode) {
-    case TestMode::MONITOR: return "MON";
-    case TestMode::STATIC_SWEEP: return "SWEEP";
-    case TestMode::AB_CENTER: return "AB-O";
-    case TestMode::LAP_CENTER: return "LAP-O";
-    case TestMode::LAP_CUSTOM: return "LAP-X";
+    case BallMode::CENTER_BALANCE: return "CENTER";
+    case BallMode::THREE_POINT: return "3-POINT";
+    case BallMode::FIXED_POINT: return "FIXED";
     }
     return "?";
 }
@@ -193,24 +225,27 @@ public:
 
     void send(const Estimate &e, float target_cm) {
         if (!uart_ || !uart_->is_open()) return;
-        std::vector<uint8_t> frame;
-        frame.reserve(20);
-        frame.push_back(FRAME_HEAD_0);
-        frame.push_back(FRAME_HEAD_1);
-        frame.push_back(FRAME_DATA_SIZE);
+        std::array<uint8_t, VISION_FRAME_SIZE> frame{
+            '[', 'N', 'a', 'N', ' ', 'N', 'a', 'N', ' ', '*', ']'
+        };
 
-        const double invalid = std::numeric_limits<double>::quiet_NaN();
-        const double delta_x = e.valid ? static_cast<double>(target_cm - e.position_cm) : invalid;
-        const double delta_y = e.valid ? static_cast<double>(e.velocity_cm_s) : invalid;
-        append_double_le(frame, delta_x);
-        append_double_le(frame, delta_y);
+        if (e.valid) {
+            const int error_mm = std::clamp(
+                static_cast<int>(std::lround((target_cm - e.position_cm) * 10.0F)), -999, 999);
+            const int velocity_mm_s = std::clamp(
+                static_cast<int>(std::lround(e.velocity_cm_s * 10.0F)), -999, 999);
+            char error[5] = {};
+            char velocity[5] = {};
+            std::snprintf(error, sizeof(error), "%+04d", error_mm);
+            std::snprintf(velocity, sizeof(velocity), "%+04d", velocity_mm_s);
+            std::memcpy(&frame[1], error, 4);
+            std::memcpy(&frame[5], velocity, 4);
+        }
 
-        uint8_t checksum = 0;
-        for (size_t i = 3; i < frame.size(); ++i)
-            checksum = static_cast<uint8_t>(checksum + frame[i]);
-        frame.push_back(checksum);
-        if (uart_->write(frame.data(), static_cast<int>(frame.size())) < 0)
-            log::warn("UART vision packet write failed");
+        const int written = uart_->write(frame.data(), static_cast<int>(frame.size()));
+        if (written != static_cast<int>(frame.size()))
+            log::warn("UART vision packet short write: %d/%u", written,
+                      static_cast<unsigned>(frame.size()));
     }
 
 private:
@@ -260,16 +295,16 @@ int app_main(int argc, char **argv) {
     err::check_raise(detector.load(model_path), "failed to load steel-ball model");
     const image::Format detector_format = detector.input_format();
 
-    camera::Camera stream_camera(STREAM_W, STREAM_H, image::FMT_YVU420SP, nullptr, STREAM_FPS, 3);
+    camera::Camera stream_camera(STREAM_W, STREAM_H, image::FMT_YVU420SP, nullptr, CAMERA_FPS, 3);
     std::unique_ptr<camera::Camera> camera(
-        stream_camera.add_channel(CAM_W, CAM_H, detector_format, STREAM_FPS, 3));
+        stream_camera.add_channel(CAM_W, CAM_H, detector_format, CAMERA_FPS, 3));
     err::check_null_raise(camera.get(), "failed to create detector channel");
     display::Display display;
     touchscreen::TouchScreen touch;
     touch.clear();
     SerialLink serial(uart_port);
 
-    rtsp::Rtsp rtsp("", 8554, STREAM_FPS, rtsp::RTSP_STREAM_H264, 2 * 1000 * 1000);
+    rtsp::Rtsp rtsp("", 8554, CAMERA_FPS, rtsp::RTSP_STREAM_H264, 2 * 1000 * 1000);
     err::check_raise(rtsp.bind_camera(&stream_camera), "RTSP camera bind failed");
     rtsp::Region *overlay_region = rtsp.add_region(0, 0, STREAM_W, STREAM_H, image::FMT_BGRA8888);
     err::check_null_raise(overlay_region, "RTSP overlay creation failed");
@@ -282,12 +317,15 @@ int app_main(int argc, char **argv) {
     const Button target_down{176, 202, 37, 34, "T-"};
     const Button target_up{216, 202, 37, 34, "T+"};
     const Button exit_b{258, 4, 58, 36, "EXIT"};
-    TestMode mode = TestMode::MONITOR;
+    BallMode mode = BallMode::CENTER_BALANCE;
     float target_cm = 0.0F;
+    float fixed_target_cm = 0.0F;
     bool prev_pressed = false;
     PositionFilter filter;
+    ThreePointSequence three_point;
     Estimate estimate;
     uint64_t fps_window_start_ms = time::ticks_ms();
+    uint64_t last_ui_update_ms = 0;
     uint32_t fps_frame_count = 0;
 
     while (!app::need_exit()) {
@@ -323,63 +361,92 @@ int app_main(int argc, char **argv) {
                     log::info("captured %.1fcm point at (%.1f, %.1f)", cfg.right_cm,
                               cfg.right_px.x, cfg.right_px.y);
                 } else if (inside(mode_b, x, y)) {
-                    mode = static_cast<TestMode>((static_cast<int>(mode) + 1) % 5);
-                    if (mode != TestMode::LAP_CUSTOM) target_cm = 0.0F;
+                    mode = static_cast<BallMode>((static_cast<int>(mode) + 1) % 3);
+                    if (mode == BallMode::THREE_POINT) {
+                        three_point.reset();
+                        target_cm = three_point.target_cm();
+                        log::info("3-POINT sequence started at %+.1fcm", target_cm);
+                    } else if (mode == BallMode::CENTER_BALANCE) {
+                        target_cm = 0.0F;
+                    } else {
+                        target_cm = fixed_target_cm;
+                    }
                 } else if (inside(target_down, x, y)) {
-                    target_cm = std::max(-10.0F, target_cm - 0.5F);
-                    mode = TestMode::LAP_CUSTOM;
+                    fixed_target_cm = std::max(-10.0F, fixed_target_cm - 0.5F);
+                    target_cm = fixed_target_cm;
+                    mode = BallMode::FIXED_POINT;
                 } else if (inside(target_up, x, y)) {
-                    target_cm = std::min(10.0F, target_cm + 0.5F);
-                    mode = TestMode::LAP_CUSTOM;
+                    fixed_target_cm = std::min(10.0F, fixed_target_cm + 0.5F);
+                    target_cm = fixed_target_cm;
+                    mode = BallMode::FIXED_POINT;
                 }
             }
             prev_pressed = pressed;
         }
 
-        serial.send(estimate, target_cm);
-
-        const image::Color valid_color = estimate.valid ? image::COLOR_GREEN : image::COLOR_RED;
-        frame->draw_rect(cfg.roi_x1, cfg.roi_y1, cfg.roi_x2 - cfg.roi_x1,
-                         cfg.roi_y2 - cfg.roi_y1, image::COLOR_YELLOW, 1);
-        frame->draw_line(static_cast<int>(cfg.left_px.x), static_cast<int>(cfg.left_px.y),
-                         static_cast<int>(cfg.right_px.x), static_cast<int>(cfg.right_px.y),
-                         image::COLOR_BLUE, 2);
-        frame->draw_cross(static_cast<int>(cfg.left_px.x), static_cast<int>(cfg.left_px.y),
-                          image::COLOR_BLUE, 8, 2);
-        frame->draw_cross(static_cast<int>(cfg.right_px.x), static_cast<int>(cfg.right_px.y),
-                          image::COLOR_BLUE, 8, 2);
-        if (ball) {
-            frame->draw_rect(ball->x, ball->y, ball->w, ball->h, valid_color, 3);
-            frame->draw_cross(static_cast<int>(estimate.center.x), static_cast<int>(estimate.center.y),
-                              image::COLOR_RED, 10, 2);
+        const uint64_t send_ms = time::ticks_ms();
+        const uint64_t processing_delay_ms = send_ms >= now ? send_ms - now : 0;
+        Estimate control_estimate = extrapolate_estimate(estimate, processing_delay_ms);
+        if (mode == BallMode::THREE_POINT) {
+            three_point.update(control_estimate, send_ms);
+            target_cm = three_point.target_cm();
         }
-        char status[160];
-        std::snprintf(status, sizeof(status), "%s x:%+.2fcm v:%+.1f T:%+.1f",
-                      mode_name(mode), estimate.position_cm, estimate.velocity_cm_s, target_cm);
-        frame->draw_string(4, 4, status, valid_color, 1.0F);
-        draw_button(*frame, cal_l, image::COLOR_YELLOW);
-        draw_button(*frame, cal_r, image::COLOR_YELLOW);
-        draw_button(*frame, mode_b, image::COLOR_GREEN);
-        draw_button(*frame, target_down, image::COLOR_BLUE);
-        draw_button(*frame, target_up, image::COLOR_BLUE);
-        draw_button(*frame, exit_b, image::COLOR_RED);
+        serial.send(control_estimate, target_cm);
 
-        std::unique_ptr<image::Image> overlay(overlay_region->get_canvas());
-        if (overlay) {
-            overlay->draw_string(8, 8, status, valid_color, 2.0F);
-            overlay->draw_line(static_cast<int>(cfg.left_px.x * 2), static_cast<int>(cfg.left_px.y * 2),
-                               static_cast<int>(cfg.right_px.x * 2), static_cast<int>(cfg.right_px.y * 2),
-                               image::COLOR_BLUE, 4);
+        if (send_ms - last_ui_update_ms >= UI_UPDATE_INTERVAL_MS) {
+            last_ui_update_ms = send_ms;
+            const image::Color valid_color = estimate.valid ? image::COLOR_GREEN : image::COLOR_RED;
+            frame->draw_rect(cfg.roi_x1, cfg.roi_y1, cfg.roi_x2 - cfg.roi_x1,
+                             cfg.roi_y2 - cfg.roi_y1, image::COLOR_YELLOW, 1);
+            frame->draw_line(static_cast<int>(cfg.left_px.x), static_cast<int>(cfg.left_px.y),
+                             static_cast<int>(cfg.right_px.x), static_cast<int>(cfg.right_px.y),
+                             image::COLOR_BLUE, 2);
+            frame->draw_cross(static_cast<int>(cfg.left_px.x), static_cast<int>(cfg.left_px.y),
+                              image::COLOR_BLUE, 8, 2);
+            frame->draw_cross(static_cast<int>(cfg.right_px.x), static_cast<int>(cfg.right_px.y),
+                              image::COLOR_BLUE, 8, 2);
             if (ball) {
-                overlay->draw_rect(ball->x * 2, ball->y * 2, ball->w * 2, ball->h * 2,
-                                   image::COLOR_GREEN, 6);
-                overlay->draw_cross(static_cast<int>(estimate.center.x * 2),
-                                    static_cast<int>(estimate.center.y * 2),
-                                    image::COLOR_RED, 20, 4);
+                frame->draw_rect(ball->x, ball->y, ball->w, ball->h, valid_color, 3);
+                frame->draw_cross(static_cast<int>(estimate.center.x),
+                                  static_cast<int>(estimate.center.y), image::COLOR_RED, 10, 2);
             }
-            overlay_region->update_canvas();
+            char mode_status[24] = {};
+            if (mode == BallMode::THREE_POINT) {
+                std::snprintf(mode_status, sizeof(mode_status), "3PT%d%s",
+                              three_point.phase_number(), three_point.complete() ? "-DONE" : "");
+            } else {
+                std::snprintf(mode_status, sizeof(mode_status), "%s", mode_name(mode));
+            }
+            char status[160];
+            std::snprintf(status, sizeof(status), "%s x:%+.2f v:%+.1f T:%+.1f L:%llums",
+                          mode_status, control_estimate.position_cm, control_estimate.velocity_cm_s,
+                          target_cm, static_cast<unsigned long long>(processing_delay_ms));
+            frame->draw_string(4, 4, status, valid_color, 1.0F);
+            draw_button(*frame, cal_l, image::COLOR_YELLOW);
+            draw_button(*frame, cal_r, image::COLOR_YELLOW);
+            draw_button(*frame, mode_b, image::COLOR_GREEN);
+            draw_button(*frame, target_down, image::COLOR_BLUE);
+            draw_button(*frame, target_up, image::COLOR_BLUE);
+            draw_button(*frame, exit_b, image::COLOR_RED);
+
+            std::unique_ptr<image::Image> overlay(overlay_region->get_canvas());
+            if (overlay) {
+                overlay->draw_string(8, 8, status, valid_color, 2.0F);
+                overlay->draw_line(static_cast<int>(cfg.left_px.x * 2),
+                                   static_cast<int>(cfg.left_px.y * 2),
+                                   static_cast<int>(cfg.right_px.x * 2),
+                                   static_cast<int>(cfg.right_px.y * 2), image::COLOR_BLUE, 4);
+                if (ball) {
+                    overlay->draw_rect(ball->x * 2, ball->y * 2, ball->w * 2, ball->h * 2,
+                                       image::COLOR_GREEN, 6);
+                    overlay->draw_cross(static_cast<int>(estimate.center.x * 2),
+                                        static_cast<int>(estimate.center.y * 2),
+                                        image::COLOR_RED, 20, 4);
+                }
+                overlay_region->update_canvas();
+            }
+            display.show(*frame);
         }
-        display.show(*frame);
 
         ++fps_frame_count;
         const uint64_t fps_now_ms = time::ticks_ms();

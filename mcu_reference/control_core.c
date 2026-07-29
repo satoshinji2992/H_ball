@@ -14,11 +14,18 @@ void control_init(control_state_t *s) {
     };
 }
 
-void control_set_mode(control_state_t *s, uint8_t mode) { s->mode = mode; }
+void control_set_mode(control_state_t *s, mcu_run_mode_t mode) {
+    if (s->mode != mode) {
+        s->ball_i = s->line_i = s->line_prev = 0.0f;
+        s->vehicle_finished = false;
+    }
+    s->mode = mode;
+}
 
 void control_start(control_state_t *s, uint32_t now_ms) {
     s->running = true; s->phase = 0; s->start_ms = s->phase_ms = now_ms;
     s->stable_ms = 0; s->line_i = s->ball_i = 0; s->line_prev = 0;
+    s->vehicle_finished = false;
 }
 
 control_output_t control_tick(control_state_t *s, uint32_t now_ms, float dt,
@@ -26,14 +33,20 @@ control_output_t control_tick(control_state_t *s, uint32_t now_ms, float dt,
     control_output_t o = {0};
     o.elapsed_s = (now_ms - s->start_ms) * 0.001f;
     o.vision_lost = !s->vision.valid || now_ms - s->vision.received_ms > 250;
-    if (!s->running || o.vision_lost) {
+    if (!s->running || s->mode == MCU_MODE_IDLE || o.vision_lost) {
+        s->ball_i = 0.0f;
+        if (!s->running || o.vision_lost) {
+            s->line_i = 0.0f;
+            s->line_prev = 0.0f;
+        }
         o.servo_deg = s->gains.servo_center_deg; o.stop = true; return o;
     }
 
-    /* MaixCAM sends target-position in cm and ball velocity in cm/s. */
-    const float ball_error = (float)s->vision.delta_x * 10.0f;
-    const float ball_velocity = (float)s->vision.delta_y * 10.0f;
-    s->ball_i = clampf(s->ball_i + ball_error * dt, -80.0f, 80.0f);
+    /* MaixCAM sends target-position error in mm and ball velocity in mm/s. */
+    const float ball_error = (float)s->vision.ball_error_mm;
+    const float ball_velocity = (float)s->vision.ball_velocity_mm_s;
+    const bool dt_valid = dt > 0.0f && dt <= 0.05f;
+    if (dt_valid) s->ball_i = clampf(s->ball_i + ball_error * dt, -80.0f, 80.0f);
     const float tilt = s->gains.ball_kp * ball_error
                      - s->gains.ball_kd * ball_velocity
                      + s->gains.ball_ki * s->ball_i;
@@ -41,9 +54,9 @@ control_output_t control_tick(control_state_t *s, uint32_t now_ms, float dt,
                 + clampf(tilt, -s->gains.servo_limit_deg, s->gains.servo_limit_deg);
 
     /* Car line loop. line_error is normalized to roughly -1..+1 by the IR array. */
-    if (s->mode >= 2) {
-        s->line_i = clampf(s->line_i + line_error * dt, -2.0f, 2.0f);
-        const float d = dt > 0 ? (line_error - s->line_prev) / dt : 0;
+    if (s->mode >= MCU_MODE_DRIVE_AB && !s->vehicle_finished) {
+        if (dt_valid) s->line_i = clampf(s->line_i + line_error * dt, -2.0f, 2.0f);
+        const float d = dt_valid ? (line_error - s->line_prev) / dt : 0.0f;
         s->line_prev = line_error;
         const float steer = s->gains.line_kp * line_error + s->gains.line_ki * s->line_i
                           + s->gains.line_kd * d;
@@ -52,9 +65,14 @@ control_output_t control_tick(control_state_t *s, uint32_t now_ms, float dt,
         o.motor_right = clampf(s->gains.motor_base + steer * 35.0f,
                                -s->gains.motor_limit, s->gains.motor_limit);
         /* Ignore A for the first second, then stop on the next transverse marker. */
-        if (start_line_seen && now_ms - s->start_ms > 1000 && s->mode != 2) {
-            s->running = false; o.motor_left = o.motor_right = 0; o.stop = true;
+        if (start_line_seen && now_ms - s->start_ms > 1000) {
+            s->vehicle_finished = true;
+            o.motor_left = o.motor_right = 0;
+            o.stop = true;
         }
+    } else if (s->vehicle_finished) {
+        o.motor_left = o.motor_right = 0;
+        o.stop = true;
     }
     return o;
 }

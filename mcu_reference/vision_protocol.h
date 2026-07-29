@@ -3,20 +3,20 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define VISION_SOF0 0xAA
-#define VISION_SOF1 0xBB
-#define VISION_DATA_SIZE 0x10
-#define VISION_FRAME_SIZE 20
+#define VISION_SOF '['
+#define VISION_EOF0 '*'
+#define VISION_EOF1 ']'
+#define VISION_FRAME_SIZE 11
 
 typedef struct {
-    double delta_x; /* target-position, cm */
-    double delta_y; /* ball velocity, cm/s */
+    int16_t ball_error_mm;       /* target position - ball position */
+    int16_t ball_velocity_mm_s;
     uint8_t valid;
     uint32_t received_ms;
 } vision_measurement_t;
 
 typedef struct {
-    uint8_t data[64];
+    uint8_t data[VISION_FRAME_SIZE];
     size_t size;
 } vision_parser_t;
 

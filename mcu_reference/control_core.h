@@ -10,11 +10,20 @@ typedef struct {
     float motor_base, motor_limit;
 } control_gains_t;
 
+/* Selected locally by the MCU. These modes are never received from MaixCAM. */
+typedef enum {
+    MCU_MODE_IDLE = 0,
+    MCU_MODE_BALL_ONLY = 1,
+    MCU_MODE_DRIVE_AB = 2,
+    MCU_MODE_DRIVE_LAP = 3,
+} mcu_run_mode_t;
+
 typedef struct {
     control_gains_t gains;
     vision_measurement_t vision;
     bool running;
-    uint8_t mode;
+    bool vehicle_finished;
+    mcu_run_mode_t mode;
     uint8_t phase;
     uint32_t start_ms, phase_ms, stable_ms;
     float line_i, line_prev, ball_i;
@@ -30,7 +39,7 @@ typedef struct {
 } control_output_t;
 
 void control_init(control_state_t *s);
-void control_set_mode(control_state_t *s, uint8_t mode);
+void control_set_mode(control_state_t *s, mcu_run_mode_t mode);
 void control_start(control_state_t *s, uint32_t now_ms);
 control_output_t control_tick(control_state_t *s, uint32_t now_ms, float dt_s,
                               float line_error, bool start_line_seen);
