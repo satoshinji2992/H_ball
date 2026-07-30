@@ -1,6 +1,6 @@
 [basic]
 type = cvimodel
-model = stainless_ball_h_20fps_v2_int8.cvimodel
+model = stainless_ball_h_roi_yolo11n_int8.cvimodel
 
 [extra]
 model_type = yolo11

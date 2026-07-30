@@ -2,7 +2,6 @@
 #include "maix_camera.hpp"
 #include "maix_display.hpp"
 #include "maix_nn_yolo11.hpp"
-#include "maix_rtsp.hpp"
 #include "maix_touchscreen.hpp"
 #include "maix_uart.hpp"
 #include "main.h"
@@ -25,15 +24,17 @@ namespace {
 
 constexpr int CAM_W = 320;
 constexpr int CAM_H = 240;
-constexpr int STREAM_W = 640;
-constexpr int STREAM_H = 480;
 constexpr int CAMERA_FPS = 30;
+constexpr int INFERENCE_ROI_X = 0;
+constexpr int INFERENCE_ROI_Y = 87;
+constexpr int INFERENCE_ROI_W = 320;
+constexpr int INFERENCE_ROI_H = 64;
 constexpr uint64_t UI_UPDATE_INTERVAL_MS = 100;
 constexpr size_t VISION_FRAME_SIZE = 11;
 constexpr uint64_t CAMERA_HALF_FRAME_MS = 1000 / CAMERA_FPS / 2;
 constexpr uint64_t MAX_LATENCY_COMPENSATION_MS = 100;
 constexpr uint64_t MAX_MISSING_PREDICTION_MS = 100;
-constexpr float THREE_POINT_POSITION_TOLERANCE_CM = 0.3F;
+constexpr float THREE_POINT_POSITION_TOLERANCE_CM = 1.5F;
 constexpr float THREE_POINT_VELOCITY_TOLERANCE_CM_S = 2.0F;
 constexpr uint64_t THREE_POINT_STABLE_MS = 500;
 
@@ -66,6 +67,14 @@ struct Estimate {
     cv::Point2f center{};
     float position_cm = 0.0F;
     float velocity_cm_s = 0.0F;
+    float score = 0.0F;
+};
+
+struct BallDetection {
+    int x = 0;
+    int y = 0;
+    int w = 0;
+    int h = 0;
     float score = 0.0F;
 };
 
@@ -266,13 +275,23 @@ static float point_to_cm(cv::Point2f p, const Config &cfg, float *perpendicular_
     return cfg.left_cm + t * (cfg.right_cm - cfg.left_cm);
 }
 
-static const nn::Object *select_ball(nn::Objects &objects, const Config &cfg) {
-    const nn::Object *best = nullptr;
+static cv::Point2f cm_to_point(float cm, const Config &cfg) {
+    const float span_cm = cfg.right_cm - cfg.left_cm;
+    if (std::abs(span_cm) < 0.001F) return cfg.left_px;
+    const float t = (cm - cfg.left_cm) / span_cm;
+    return cfg.left_px + (cfg.right_px - cfg.left_px) * t;
+}
+
+static bool select_ball(nn::Objects &objects, const Config &cfg, BallDetection &best) {
+    bool found = false;
     float best_value = -1.0F;
     const float axis_len = cv::norm(cfg.right_px - cfg.left_px);
     for (size_t i = 0; i < objects.size(); ++i) {
         const nn::Object &o = objects.at(static_cast<int>(i));
-        const cv::Point2f center(o.x + o.w * 0.5F, o.y + o.h * 0.5F);
+        const BallDetection candidate{o.x + INFERENCE_ROI_X, o.y + INFERENCE_ROI_Y,
+                                      o.w, o.h, o.score};
+        const cv::Point2f center(candidate.x + candidate.w * 0.5F,
+                                 candidate.y + candidate.h * 0.5F);
         if (center.x < cfg.roi_x1 || center.x > cfg.roi_x2 ||
             center.y < cfg.roi_y1 || center.y > cfg.roi_y2) continue;
         float perpendicular = 0.0F;
@@ -281,9 +300,13 @@ static const nn::Object *select_ball(nn::Objects &objects, const Config &cfg) {
         const float cm_hi = std::max(cfg.left_cm, cfg.right_cm) + 3.0F;
         if (perpendicular > std::max(25.0F, axis_len * 0.18F) || cm < cm_lo || cm > cm_hi) continue;
         const float value = o.score - 0.002F * perpendicular;
-        if (value > best_value) { best_value = value; best = &o; }
+        if (value > best_value) {
+            best_value = value;
+            best = candidate;
+            found = true;
+        }
     }
-    return best;
+    return found;
 }
 
 int app_main(int argc, char **argv) {
@@ -298,23 +321,11 @@ int app_main(int argc, char **argv) {
     err::check_raise(detector.load(model_path), "failed to load steel-ball model");
     const image::Format detector_format = detector.input_format();
 
-    camera::Camera stream_camera(STREAM_W, STREAM_H, image::FMT_YVU420SP, nullptr, CAMERA_FPS, 3);
-    // A single detector buffer avoids processing queued, stale frames. The
-    // RTSP channel keeps its own buffers and is not affected.
-    std::unique_ptr<camera::Camera> camera(
-        stream_camera.add_channel(CAM_W, CAM_H, detector_format, CAMERA_FPS, 1));
-    err::check_null_raise(camera.get(), "failed to create detector channel");
+    camera::Camera camera(CAM_W, CAM_H, detector_format, nullptr, CAMERA_FPS, 1);
     display::Display display;
     touchscreen::TouchScreen touch;
     touch.clear();
     SerialLink serial(uart_port);
-
-    rtsp::Rtsp rtsp("", 8554, CAMERA_FPS, rtsp::RTSP_STREAM_H264, 2 * 1000 * 1000);
-    err::check_raise(rtsp.bind_camera(&stream_camera), "RTSP camera bind failed");
-    rtsp::Region *overlay_region = rtsp.add_region(0, 0, STREAM_W, STREAM_H, image::FMT_BGRA8888);
-    err::check_null_raise(overlay_region, "RTSP overlay creation failed");
-    err::check_raise(rtsp.start(), "RTSP start failed");
-    for (const auto &url : rtsp.get_urls()) log::info("RTSP: %s", url.c_str());
 
     const Button cal_l{4, 202, 51, 34, "CAL-L"};
     const Button cal_r{58, 202, 51, 34, "CAL-R"};
@@ -336,18 +347,22 @@ int app_main(int argc, char **argv) {
     uint32_t fps_frame_count = 0;
 
     while (!app::need_exit()) {
-        std::unique_ptr<image::Image> frame(camera->read());
+        std::unique_ptr<image::Image> frame(camera.read());
         if (!frame) continue;
         const uint64_t capture_done_ms = time::ticks_ms();
         const uint64_t measurement_ms = capture_done_ms >= CAMERA_HALF_FRAME_MS
                                       ? capture_done_ms - CAMERA_HALF_FRAME_MS : 0;
+        std::unique_ptr<image::Image> inference_roi(
+            frame->crop(INFERENCE_ROI_X, INFERENCE_ROI_Y, INFERENCE_ROI_W, INFERENCE_ROI_H));
+        if (!inference_roi) continue;
         std::unique_ptr<nn::Objects> objects(
-            detector.detect(*frame, cfg.confidence, cfg.iou, image::FIT_CONTAIN));
+            detector.detect(*inference_roi, cfg.confidence, cfg.iou, image::FIT_CONTAIN));
         if (!objects) continue;
-        const nn::Object *ball = select_ball(*objects, cfg);
-        if (ball) {
-            const cv::Point2f center(ball->x + ball->w * 0.5F, ball->y + ball->h * 0.5F);
-            estimate = filter.update(true, center, point_to_cm(center, cfg), ball->score,
+        BallDetection ball;
+        const bool ball_found = select_ball(*objects, cfg, ball);
+        if (ball_found) {
+            const cv::Point2f center(ball.x + ball.w * 0.5F, ball.y + ball.h * 0.5F);
+            estimate = filter.update(true, center, point_to_cm(center, cfg), ball.score,
                                      measurement_ms);
         } else {
             estimate = filter.update(false, {}, 0.0F, 0.0F, measurement_ms);
@@ -362,11 +377,11 @@ int app_main(int argc, char **argv) {
             const int y = mapped.size() < 2 ? -1 : mapped[1];
             if (pressed && !prev_pressed) {
                 if (inside(exit_b, x, y)) break;
-                if (inside(cal_l, x, y) && ball) {
+                if (inside(cal_l, x, y) && ball_found) {
                     cfg.left_px = estimate.center; save_config(config_path, cfg);
                     log::info("captured %.1fcm point at (%.1f, %.1f)", cfg.left_cm,
                               cfg.left_px.x, cfg.left_px.y);
-                } else if (inside(cal_r, x, y) && ball) {
+                } else if (inside(cal_r, x, y) && ball_found) {
                     cfg.right_px = estimate.center; save_config(config_path, cfg);
                     log::info("captured %.1fcm point at (%.1f, %.1f)", cfg.right_cm,
                               cfg.right_px.x, cfg.right_px.y);
@@ -418,6 +433,8 @@ int app_main(int argc, char **argv) {
             const image::Color valid_color = estimate.valid ? image::COLOR_GREEN : image::COLOR_RED;
             frame->draw_rect(cfg.roi_x1, cfg.roi_y1, cfg.roi_x2 - cfg.roi_x1,
                              cfg.roi_y2 - cfg.roi_y1, image::COLOR_YELLOW, 1);
+            frame->draw_rect(INFERENCE_ROI_X, INFERENCE_ROI_Y,
+                             INFERENCE_ROI_W, INFERENCE_ROI_H, image::COLOR_GRAY, 1);
             frame->draw_line(static_cast<int>(cfg.left_px.x), static_cast<int>(cfg.left_px.y),
                              static_cast<int>(cfg.right_px.x), static_cast<int>(cfg.right_px.y),
                              image::COLOR_BLUE, 2);
@@ -425,8 +442,14 @@ int app_main(int argc, char **argv) {
                               image::COLOR_BLUE, 8, 2);
             frame->draw_cross(static_cast<int>(cfg.right_px.x), static_cast<int>(cfg.right_px.y),
                               image::COLOR_BLUE, 8, 2);
-            if (ball) {
-                frame->draw_rect(ball->x, ball->y, ball->w, ball->h, valid_color, 3);
+            const cv::Point2f target_px = cm_to_point(target_cm, cfg);
+            frame->draw_cross(static_cast<int>(target_px.x), static_cast<int>(target_px.y),
+                              image::COLOR_PURPLE, 12, 3);
+            frame->draw_string(static_cast<int>(target_px.x) - 12,
+                               std::max(22, static_cast<int>(target_px.y) - 24),
+                               "TARGET", image::COLOR_PURPLE, 0.7F);
+            if (ball_found) {
+                frame->draw_rect(ball.x, ball.y, ball.w, ball.h, valid_color, 3);
                 frame->draw_cross(static_cast<int>(estimate.center.x),
                                   static_cast<int>(estimate.center.y), image::COLOR_RED, 10, 2);
             }
@@ -455,22 +478,6 @@ int app_main(int argc, char **argv) {
                                             ? image::COLOR_GREEN : image::COLOR_GRAY);
             draw_button(*frame, exit_b, image::COLOR_RED);
 
-            std::unique_ptr<image::Image> overlay(overlay_region->get_canvas());
-            if (overlay) {
-                overlay->draw_string(8, 8, status, valid_color, 2.0F);
-                overlay->draw_line(static_cast<int>(cfg.left_px.x * 2),
-                                   static_cast<int>(cfg.left_px.y * 2),
-                                   static_cast<int>(cfg.right_px.x * 2),
-                                   static_cast<int>(cfg.right_px.y * 2), image::COLOR_BLUE, 4);
-                if (ball) {
-                    overlay->draw_rect(ball->x * 2, ball->y * 2, ball->w * 2, ball->h * 2,
-                                       image::COLOR_GREEN, 6);
-                    overlay->draw_cross(static_cast<int>(estimate.center.x * 2),
-                                        static_cast<int>(estimate.center.y * 2),
-                                        image::COLOR_RED, 20, 4);
-                }
-                overlay_region->update_canvas();
-            }
             display.show(*frame);
         }
 
@@ -487,7 +494,6 @@ int app_main(int argc, char **argv) {
             fps_window_start_ms = fps_now_ms;
         }
     }
-    rtsp.stop();
     return 0;
 }
 
