@@ -24,7 +24,7 @@ namespace {
 
 constexpr int CAM_W = 320;
 constexpr int CAM_H = 240;
-constexpr int CAMERA_FPS = 30;
+constexpr int CAMERA_FPS = 50;
 constexpr int INFERENCE_ROI_X = 0;
 constexpr int INFERENCE_ROI_Y = 87;
 constexpr int INFERENCE_ROI_W = 320;

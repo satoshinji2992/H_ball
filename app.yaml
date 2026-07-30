@@ -1,7 +1,7 @@
 id: h_ball_balance
 name: H Ball Balance
 name[zh]: H题滚球控制
-version: 1.1.0
+version: 1.1.1
 author: team
 desc: ROI-only YOLO11n ball position measurement and UART telemetry for problem H
 icon: ""
