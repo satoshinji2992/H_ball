@@ -100,8 +100,22 @@ public:
 
     void update(const Estimate &estimate, uint64_t now_ms) {
         if (complete_ || !estimate.valid || estimate.score <= 0.0F ||
-            std::abs(target_cm() - estimate.position_cm) > THREE_POINT_POSITION_TOLERANCE_CM ||
-            std::abs(estimate.velocity_cm_s) > THREE_POINT_VELOCITY_TOLERANCE_CM_S) {
+            std::abs(target_cm() - estimate.position_cm) > THREE_POINT_POSITION_TOLERANCE_CM) {
+            stable_since_ms_ = 0;
+            return;
+        }
+
+        // +5 cm is only a pass-through waypoint: switch to -5 cm as soon as
+        // the position enters its tolerance band, regardless of velocity.
+        if (phase_ == 0) {
+            ++phase_;
+            stable_since_ms_ = 0;
+            log::info("3-POINT target advanced to %+.1fcm", target_cm());
+            return;
+        }
+
+        // The final -5 cm target still requires a stationary 500 ms hold.
+        if (std::abs(estimate.velocity_cm_s) > THREE_POINT_VELOCITY_TOLERANCE_CM_S) {
             stable_since_ms_ = 0;
             return;
         }
@@ -110,15 +124,9 @@ public:
             return;
         }
         if (now_ms - stable_since_ms_ < THREE_POINT_STABLE_MS) return;
-
         stable_since_ms_ = 0;
-        if (phase_ + 1 < TARGETS_CM.size()) {
-            ++phase_;
-            log::info("3-POINT target advanced to %+.1fcm", target_cm());
-        } else {
-            complete_ = true;
-            log::info("3-POINT sequence complete");
-        }
+        complete_ = true;
+        log::info("3-POINT sequence complete");
     }
 
 private:

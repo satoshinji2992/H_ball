@@ -1,6 +1,6 @@
 # MCU 交接说明
 
-MaixCAM 应用版本：`1.1.3`，安装包：`dist/h_ball_balance_v1.1.3.zip`。
+MaixCAM 应用版本：`1.1.4`，安装包：`dist/h_ball_balance_v1.1.4.zip`。
 
 ## 功能分工
 
@@ -10,7 +10,8 @@ MCU 只需解析数据并控制摆杆，不需要知道 MaixCAM 当前模式或�
 滚球模式：
 
 - `CENTER`：目标 `0cm`。
-- `3-POINT`：进入后保持 `0cm`；触摸 `START` 后依次到 `+5cm`、`-5cm`。
+- `3-POINT`：进入后保持 `0cm`；触摸 `START` 后先到 `+5cm`，球进入 ±15mm
+  区域便立即切换到 `-5cm`，不在 `+5cm` 停留。
 - `FIXED`：触摸 `T-`、`T+` 设置目标，每次变化 `0.5cm`。
 
 三点模式在位置误差不超过 `15mm`、速度不超过 `20mm/s` 并持续 500ms 后自动切换。
@@ -102,4 +103,5 @@ tilt = Kp × error - Kd × velocity + Ki × integral
 - 球向 `CAL-R` 运动：速度为正。
 - 遮住球并经过短时预测窗口后：收到 `[NaN NaN *]`。
 - UART 中断超过 250ms：摆杆回中。
-- 三点模式按 `START` 后按 `+5 -> -5cm` 自动切换。
+- 三点模式按 `START` 后按 `+5 -> -5cm` 自动切换；进入 `+5cm` 的 ±15mm
+  区域就应切换，不要求在 `+5cm` 稳定。
