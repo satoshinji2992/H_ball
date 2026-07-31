@@ -24,14 +24,14 @@ namespace {
 
 constexpr int CAM_W = 320;
 constexpr int CAM_H = 240;
-constexpr int CAMERA_FPS = 50;
+constexpr int CAMERA_FPS = 90;
 constexpr int INFERENCE_ROI_X = 0;
 constexpr int INFERENCE_ROI_Y = 87;
 constexpr int INFERENCE_ROI_W = 320;
 constexpr int INFERENCE_ROI_H = 64;
 constexpr uint64_t UI_UPDATE_INTERVAL_MS = 100;
 constexpr size_t VISION_FRAME_SIZE = 11;
-constexpr uint64_t CAMERA_HALF_FRAME_MS = 1000 / CAMERA_FPS / 2;
+constexpr uint64_t CAMERA_HALF_FRAME_MS = (500 + CAMERA_FPS / 2) / CAMERA_FPS;
 constexpr uint64_t MAX_LATENCY_COMPENSATION_MS = 100;
 constexpr uint64_t MAX_MISSING_PREDICTION_MS = 100;
 constexpr float THREE_POINT_POSITION_TOLERANCE_CM = 1.5F;
