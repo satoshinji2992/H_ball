@@ -372,10 +372,12 @@ int app_main(int argc, char **argv) {
     const Button target_down{176, 202, 37, 34, "T-"};
     const Button target_up{216, 202, 37, 34, "T+"};
     const Button start_b{256, 202, 60, 34, "START"};
+    const Button step_b{196, 4, 58, 36, "STEP"};
     const Button exit_b{258, 4, 58, 36, "EXIT"};
     BallMode mode = BallMode::CENTER_BALANCE;
     float target_cm = 0.0F;
-    float fixed_target_cm = 0.0F;
+    int fixed_target_mm = 0;
+    bool fine_adjust = false;
     bool three_point_running = false;
     bool prev_pressed = false;
     PositionFilter filter;
@@ -416,7 +418,10 @@ int app_main(int argc, char **argv) {
             const int y = mapped.size() < 2 ? -1 : mapped[1];
             if (pressed && !prev_pressed) {
                 if (inside(exit_b, x, y)) break;
-                if (inside(cal_l, x, y) && ball_found) {
+                if (inside(step_b, x, y)) {
+                    fine_adjust = !fine_adjust;
+                    log::info("FIXED adjustment step: %dmm", fine_adjust ? 1 : 5);
+                } else if (inside(cal_l, x, y) && ball_found) {
                     cfg.left_px = estimate.center; save_config(config_path, cfg);
                     log::info("captured %.1fcm point at (%.1f, %.1f)", cfg.left_cm,
                               cfg.left_px.x, cfg.left_px.y);
@@ -436,16 +441,16 @@ int app_main(int argc, char **argv) {
                         target_cm = 0.0F;
                     } else {
                         three_point_running = false;
-                        target_cm = fixed_target_cm;
+                        target_cm = static_cast<float>(fixed_target_mm) * 0.1F;
                     }
                 } else if (inside(target_down, x, y)) {
-                    fixed_target_cm = std::max(-10.0F, fixed_target_cm - 0.5F);
-                    target_cm = fixed_target_cm;
+                    fixed_target_mm = std::max(-100, fixed_target_mm - (fine_adjust ? 1 : 5));
+                    target_cm = static_cast<float>(fixed_target_mm) * 0.1F;
                     mode = BallMode::FIXED_POINT;
                     three_point_running = false;
                 } else if (inside(target_up, x, y)) {
-                    fixed_target_cm = std::min(10.0F, fixed_target_cm + 0.5F);
-                    target_cm = fixed_target_cm;
+                    fixed_target_mm = std::min(100, fixed_target_mm + (fine_adjust ? 1 : 5));
+                    target_cm = static_cast<float>(fixed_target_mm) * 0.1F;
                     mode = BallMode::FIXED_POINT;
                     three_point_running = false;
                 } else if (inside(start_b, x, y) && mode == BallMode::THREE_POINT) {
@@ -514,13 +519,17 @@ int app_main(int argc, char **argv) {
                     std::snprintf(mode_status, sizeof(mode_status), "3PT%+.0f%s",
                                   target_cm, three_point.complete() ? "-DONE" : "");
                 }
+            } else if (mode == BallMode::FIXED_POINT) {
+                std::snprintf(mode_status, sizeof(mode_status), "FIXED-%dMM",
+                              fine_adjust ? 1 : 5);
             } else {
                 std::snprintf(mode_status, sizeof(mode_status), "%s", mode_name(mode));
             }
             char status[160];
-            std::snprintf(status, sizeof(status), "%s x:%+.2f v:%+.1f T:%+.1f L:%llums",
+            std::snprintf(status, sizeof(status), "%s x:%+.2f v:%+.1f T:%+dmm L:%llums",
                           mode_status, control_estimate.position_cm, control_estimate.velocity_cm_s,
-                          target_cm, static_cast<unsigned long long>(measurement_age_ms));
+                          static_cast<int>(std::lround(target_cm * 10.0F)),
+                          static_cast<unsigned long long>(measurement_age_ms));
             frame->draw_string(4, 44, status, valid_color, 0.85F);
             frame->draw_string(4, 4, wifi.display_status(),
                                wifi.connected() ? image::COLOR_GREEN : image::COLOR_ORANGE,
@@ -532,6 +541,10 @@ int app_main(int argc, char **argv) {
             draw_button(*frame, target_up, image::COLOR_BLUE);
             draw_button(*frame, start_b, mode == BallMode::THREE_POINT
                                             ? image::COLOR_GREEN : image::COLOR_GRAY);
+            const Button step_display{step_b.x, step_b.y, step_b.w, step_b.h,
+                                      fine_adjust ? "1MM" : "5MM"};
+            draw_button(*frame, step_display, fine_adjust
+                                                ? image::COLOR_PURPLE : image::COLOR_BLUE);
             draw_button(*frame, exit_b, image::COLOR_RED);
 
             // Display, browser stream and recording all consume this exact annotated frame.

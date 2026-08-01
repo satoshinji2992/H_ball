@@ -1,7 +1,7 @@
 id: h_ball_balance
 name: H Ball Balance
 name[zh]: H题滚球控制
-version: 1.2.1
+version: 1.2.2
 author: team
 desc: ROI YOLO11n ball control with UART and low-overhead browser monitoring
 icon: ""
