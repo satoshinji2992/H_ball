@@ -1,10 +1,14 @@
+#include "avi_mjpeg.hpp"
+#include "connectivity.hpp"
 #include "maix_basic.hpp"
 #include "maix_camera.hpp"
 #include "maix_display.hpp"
+#include "maix_jpg_stream.hpp"
 #include "maix_nn_yolo11.hpp"
 #include "maix_touchscreen.hpp"
 #include "maix_uart.hpp"
 #include "main.h"
+#include "web_monitor.hpp"
 
 #include <opencv2/core.hpp>
 
@@ -29,7 +33,8 @@ constexpr int INFERENCE_ROI_X = 0;
 constexpr int INFERENCE_ROI_Y = 87;
 constexpr int INFERENCE_ROI_W = 320;
 constexpr int INFERENCE_ROI_H = 64;
-constexpr uint64_t UI_UPDATE_INTERVAL_MS = 100;
+constexpr int MONITOR_FPS = 15;
+constexpr uint64_t VISUAL_UPDATE_INTERVAL_MS = (1000 + MONITOR_FPS / 2) / MONITOR_FPS;
 constexpr size_t VISION_FRAME_SIZE = 11;
 constexpr uint64_t CAMERA_HALF_FRAME_MS = (500 + CAMERA_FPS / 2) / CAMERA_FPS;
 constexpr uint64_t MAX_LATENCY_COMPENSATION_MS = 100;
@@ -319,11 +324,16 @@ static bool select_ball(nn::Objects &objects, const Config &cfg, BallDetection &
 
 int app_main(int argc, char **argv) {
     if (argc < 2) throw err::Exception(err::ERR_ARGS,
-        "usage: h_ball_balance MODEL.mud [uart=/dev/ttyS0|none] [config]");
+        "usage: h_ball_balance MODEL.mud [uart=/dev/ttyS0|none] [calibration] [network]");
     const std::string model_path = argv[1];
     const std::string uart_port = argc > 2 ? argv[2] : "/dev/ttyS0";
     const std::string config_path = argc > 3 ? argv[3] : "./balance_calibration.cfg";
+    const std::string network_path = argc > 4 ? argv[4] : "./network.cfg";
     Config cfg = load_config(config_path);
+    const NetworkConfig network_cfg = load_network_config(network_path);
+    const std::string recordings_dir = resolve_config_path(network_path,
+                                                            network_cfg.recordings_dir);
+    err::check_raise(fs::mkdir(recordings_dir, true, true), "failed to create recordings directory");
 
     nn::YOLO11 detector("", false);
     err::check_raise(detector.load(model_path), "failed to load steel-ball model");
@@ -334,6 +344,27 @@ int app_main(int argc, char **argv) {
     touchscreen::TouchScreen touch;
     touch.clear();
     SerialLink serial(uart_port);
+    WifiManager wifi(network_path);
+    http::JpegStreamer streamer("", network_cfg.stream_port, 4);
+    err::check_raise(streamer.start(), "failed to start 15 FPS JPEG stream");
+    WebMonitor web(network_cfg.web_port, network_cfg.stream_port, recordings_dir,
+                   [&wifi]() { return wifi.web_status_json(); });
+    AviMjpegWriter recorder;
+    std::string recording_filename;
+    const auto finalize_recording = [&]() {
+        if (!recorder.is_open()) return;
+        const uint32_t frames = recorder.frame_count();
+        recorder.close();
+        const std::string partial_path = recordings_dir + '/' + recording_filename + ".part";
+        const std::string final_path = recordings_dir + '/' + recording_filename;
+        if (std::rename(partial_path.c_str(), final_path.c_str()) == 0) {
+            log::info("recording saved: %s (%u frames)", final_path.c_str(),
+                      static_cast<unsigned>(frames));
+        } else {
+            log::error("failed to finalize recording: %s", partial_path.c_str());
+        }
+        web.update_recording(false, recording_filename, 0);
+    };
 
     const Button cal_l{4, 202, 51, 34, "CAL-L"};
     const Button cal_r{58, 202, 51, 34, "CAL-R"};
@@ -341,6 +372,7 @@ int app_main(int argc, char **argv) {
     const Button target_down{176, 202, 37, 34, "T-"};
     const Button target_up{216, 202, 37, 34, "T+"};
     const Button start_b{256, 202, 60, 34, "START"};
+    const Button wifi_b{196, 4, 58, 36, "WIFI"};
     const Button exit_b{258, 4, 58, 36, "EXIT"};
     BallMode mode = BallMode::CENTER_BALANCE;
     float target_cm = 0.0F;
@@ -351,7 +383,7 @@ int app_main(int argc, char **argv) {
     ThreePointSequence three_point;
     Estimate estimate;
     uint64_t fps_window_start_ms = time::ticks_ms();
-    uint64_t last_ui_update_ms = 0;
+    uint64_t last_visual_update_ms = 0;
     uint32_t fps_frame_count = 0;
 
     while (!app::need_exit()) {
@@ -385,7 +417,10 @@ int app_main(int argc, char **argv) {
             const int y = mapped.size() < 2 ? -1 : mapped[1];
             if (pressed && !prev_pressed) {
                 if (inside(exit_b, x, y)) break;
-                if (inside(cal_l, x, y) && ball_found) {
+                if (inside(wifi_b, x, y)) {
+                    wifi.request_reconnect();
+                    log::info("touch requested WiFi rescan/reconnect");
+                } else if (inside(cal_l, x, y) && ball_found) {
                     cfg.left_px = estimate.center; save_config(config_path, cfg);
                     log::info("captured %.1fcm point at (%.1f, %.1f)", cfg.left_cm,
                               cfg.left_px.x, cfg.left_px.y);
@@ -436,8 +471,22 @@ int app_main(int argc, char **argv) {
         }
         serial.send(control_estimate, target_cm);
 
-        if (send_ms - last_ui_update_ms >= UI_UPDATE_INTERVAL_MS) {
-            last_ui_update_ms = send_ms;
+        if (web.take_stop_record_request() && recorder.is_open()) {
+            finalize_recording();
+        }
+        if (web.take_start_record_request() && !recorder.is_open()) {
+            recording_filename = make_recording_filename();
+            const std::string recording_path = recordings_dir + '/' + recording_filename + ".part";
+            if (recorder.open(recording_path, CAM_W, CAM_H, MONITOR_FPS)) {
+                web.update_recording(true, recording_filename, 0);
+                log::info("recording started: %s", recording_path.c_str());
+            } else {
+                log::error("failed to start recording: %s", recording_path.c_str());
+            }
+        }
+
+        if (send_ms - last_visual_update_ms >= VISUAL_UPDATE_INTERVAL_MS) {
+            last_visual_update_ms = send_ms;
             const image::Color valid_color = estimate.valid ? image::COLOR_GREEN : image::COLOR_RED;
             frame->draw_rect(cfg.roi_x1, cfg.roi_y1, cfg.roi_x2 - cfg.roi_x1,
                              cfg.roi_y2 - cfg.roi_y1, image::COLOR_YELLOW, 1);
@@ -476,7 +525,10 @@ int app_main(int argc, char **argv) {
             std::snprintf(status, sizeof(status), "%s x:%+.2f v:%+.1f T:%+.1f L:%llums",
                           mode_status, control_estimate.position_cm, control_estimate.velocity_cm_s,
                           target_cm, static_cast<unsigned long long>(measurement_age_ms));
-            frame->draw_string(4, 4, status, valid_color, 1.0F);
+            frame->draw_string(4, 44, status, valid_color, 0.85F);
+            frame->draw_string(4, 4, wifi.display_status(),
+                               wifi.connected() ? image::COLOR_GREEN : image::COLOR_ORANGE,
+                               0.75F);
             draw_button(*frame, cal_l, image::COLOR_YELLOW);
             draw_button(*frame, cal_r, image::COLOR_YELLOW);
             draw_button(*frame, mode_b, image::COLOR_GREEN);
@@ -484,9 +536,24 @@ int app_main(int argc, char **argv) {
             draw_button(*frame, target_up, image::COLOR_BLUE);
             draw_button(*frame, start_b, mode == BallMode::THREE_POINT
                                             ? image::COLOR_GREEN : image::COLOR_GRAY);
+            draw_button(*frame, wifi_b, wifi.connected()
+                                            ? image::COLOR_GREEN : image::COLOR_ORANGE);
             draw_button(*frame, exit_b, image::COLOR_RED);
 
+            // Display, browser stream and recording all consume this exact annotated frame.
             display.show(*frame);
+            std::unique_ptr<image::Image> jpeg(frame->to_jpeg(network_cfg.jpeg_quality));
+            if (jpeg) {
+                streamer.write(jpeg.get());
+                if (recorder.is_open()) {
+                    if (!recorder.write_frame(jpeg->data(), jpeg->data_size())) {
+                        log::error("recording write failed; closing current AVI");
+                        finalize_recording();
+                    } else {
+                        web.update_recording(true, recording_filename, recorder.frame_count());
+                    }
+                }
+            }
         }
 
         ++fps_frame_count;
@@ -502,6 +569,10 @@ int app_main(int argc, char **argv) {
             fps_window_start_ms = fps_now_ms;
         }
     }
+    if (recorder.is_open()) {
+        finalize_recording();
+    }
+    streamer.stop();
     return 0;
 }
 

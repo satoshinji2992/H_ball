@@ -12,5 +12,6 @@ else
 fi
 uart_port="${2:-/dev/ttyS0}"
 config="${3:-$app_dir/balance_calibration.cfg}"
+network_config="${4:-$app_dir/network.cfg}"
 
-exec "$app_dir/h_ball_balance" "$model" "$uart_port" "$config"
+exec "$app_dir/h_ball_balance" "$model" "$uart_port" "$config" "$network_config"
