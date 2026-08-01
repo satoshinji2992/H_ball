@@ -8,7 +8,7 @@
 ## 当前状态
 
 - MaixCAM C++ 应用已完成交叉编译。
-- 安装包：`dist/h_ball_balance_v1.2.0.zip`。
+- 安装包：`dist/h_ball_balance_v1.2.1.zip`。
 - YOLO `.mud` 与 `.cvimodel` 已包含在安装包的 `models/` 目录。
 - ROI 专用 YOLO11n 已加入真实管头、管尾录像及曝光、模糊和小幅几何增强。按
   10fps 抽帧后保留末尾 20%（55 帧）作验证，验证集整体 `P=1.000`、`R=1.000`、
@@ -18,8 +18,8 @@
   来自同一次录像，标签由单球约束、固定端点和检测结果校正，指标不等同于独立
   人工标注测试；最终仍应以 MaixCAM 上机复测为准。
 - UART 解析器和滚球控制参考代码均带主机单元测试。
-- 启动后按 `network.cfg` 自动扫描并连接热点；断线会在后台重试，不阻塞识别和
-  UART。触屏显示连接状态，修改配置后按 `WIFI` 可立即重新扫描和连接。
+- 应用不会扫描、连接、断开或重启 Wi-Fi。热点完全由 MaixCAM 系统设置管理，
+  应用只读显示连接状态和 IP，避免比赛过程中干扰现有连接。
 - 浏览器显示与触屏相同的识别标注画面，固定 15fps。录像复用图传的 JPEG 帧封装
   为 MJPEG-AVI，不重复推理或编码；浏览器可开始/停止录像并下载已完成文件。
 
@@ -54,7 +54,6 @@
 | `MODE` | `CENTER -> 3-POINT -> FIXED` |
 | `START` | 在 `3-POINT` 模式下开始或重新开始三点序列 |
 | `T-` / `T+` | 定点每次减/加 `0.5cm`，范围 `-10..+10cm`，并进入 `FIXED` |
-| `WIFI` | 重新读取网络配置，扫描并连接热点 |
 | `EXIT` | 退出应用 |
 
 三点模式进入后先显示 `3PT-WAIT`，目标保持 `0cm`。按 `START` 后目标立即切到
@@ -83,36 +82,22 @@ MaixCAM A16(TX) 接 MCU RX，双方共地。协议解析见
 
 ## Wi-Fi、图传和录像
 
-安装后通过 SSH 编辑应用目录中的 `network.cfg`：
+先退出应用，在 MaixCAM 系统设置中手动连接热点，再重新启动本应用。应用不会修改
+系统网络配置；触屏左上角只显示 `NET IP地址` 或 `NET OFFLINE`。
 
-```ini
-ssid=你的热点名
-password=你的热点密码
-web_port=8080
-stream_port=8000
-jpeg_quality=75
-recordings_dir=./recordings
-```
+电脑接入同一热点后，浏览器打开 `http://触屏显示的IP:8080`。监控页可开始/停止
+录像；停止后录像出现在下载列表。正在写入的 AVI 不允许下载，退出应用时会自动
+收尾保存。MJPEG 图传端口固定为 `8000`，浏览器管理端口固定为 `8080`。
 
-如果不确定安装目录，可执行：
-
-```bash
-find /root -path '*/h_ball_balance/network.cfg'
-```
-
-保存后重启应用，或在触屏按 `WIFI`。连上后触屏左上角显示 IP，电脑接入同一热点，
-浏览器打开 `http://该IP:8080`。监控页可开始/停止录像；停止后录像出现在下载列表。
-正在写入的 AVI 不允许下载，退出应用时会自动收尾保存。
-
-`network.cfg` 中密码是明文，请不要提交真实密码，也不要把 8080/8000 端口暴露到
-不可信网络。录像不会自动删除，比赛前应检查存储空间并通过 SSH 清理旧文件。
+不要把 8080/8000 端口暴露到不可信网络。录像不会自动删除，比赛前应检查存储
+空间并通过 SSH 清理应用目录下的 `recordings/`。
 
 ## 编译与运行
 
 ```bash
 MAIXCDK_PATH=/path/to/MaixCDK maixcdk build -p maixcam
 ./build/h_ball_balance ./models/stainless_ball.mud /dev/ttyS0 \
-  ./balance_calibration.cfg ./network.cfg
+  ./balance_calibration.cfg ./recordings
 ```
 
 应用启动器会自动使用包内模型。未连接 MCU 时可把串口参数改为 `none`。

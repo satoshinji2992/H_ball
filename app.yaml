@@ -1,7 +1,7 @@
 id: h_ball_balance
 name: H Ball Balance
 name[zh]: H题滚球控制
-version: 1.2.0
+version: 1.2.1
 author: team
 desc: ROI YOLO11n ball control with UART and low-overhead browser monitoring
 icon: ""
@@ -10,6 +10,5 @@ files:
   app.yaml: app.yaml
   main.sh: main.sh
   balance_calibration.cfg: balance_calibration.cfg
-  network.cfg: network.cfg
   models/stainless_ball.mud: models/stainless_ball.mud
   models/stainless_ball_h_roi_yolo11n_int8.cvimodel: models/stainless_ball_h_roi_yolo11n_int8.cvimodel

@@ -1,6 +1,6 @@
 # MCU 交接说明
 
-MaixCAM 应用版本：`1.2.0`，安装包：`dist/h_ball_balance_v1.2.0.zip`。
+MaixCAM 应用版本：`1.2.1`，安装包：`dist/h_ball_balance_v1.2.1.zip`。
 
 ## 功能分工
 

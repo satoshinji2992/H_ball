@@ -29,6 +29,9 @@ namespace {
 constexpr int CAM_W = 320;
 constexpr int CAM_H = 240;
 constexpr int CAMERA_FPS = 90;
+constexpr int STREAM_PORT = 8000;
+constexpr int WEB_PORT = 8080;
+constexpr int JPEG_QUALITY = 75;
 constexpr int INFERENCE_ROI_X = 0;
 constexpr int INFERENCE_ROI_Y = 87;
 constexpr int INFERENCE_ROI_W = 320;
@@ -324,15 +327,12 @@ static bool select_ball(nn::Objects &objects, const Config &cfg, BallDetection &
 
 int app_main(int argc, char **argv) {
     if (argc < 2) throw err::Exception(err::ERR_ARGS,
-        "usage: h_ball_balance MODEL.mud [uart=/dev/ttyS0|none] [calibration] [network]");
+        "usage: h_ball_balance MODEL.mud [uart=/dev/ttyS0|none] [calibration] [recordings_dir]");
     const std::string model_path = argv[1];
     const std::string uart_port = argc > 2 ? argv[2] : "/dev/ttyS0";
     const std::string config_path = argc > 3 ? argv[3] : "./balance_calibration.cfg";
-    const std::string network_path = argc > 4 ? argv[4] : "./network.cfg";
+    const std::string recordings_dir = argc > 4 ? argv[4] : "./recordings";
     Config cfg = load_config(config_path);
-    const NetworkConfig network_cfg = load_network_config(network_path);
-    const std::string recordings_dir = resolve_config_path(network_path,
-                                                            network_cfg.recordings_dir);
     err::check_raise(fs::mkdir(recordings_dir, true, true), "failed to create recordings directory");
 
     nn::YOLO11 detector("", false);
@@ -344,10 +344,10 @@ int app_main(int argc, char **argv) {
     touchscreen::TouchScreen touch;
     touch.clear();
     SerialLink serial(uart_port);
-    WifiManager wifi(network_path);
-    http::JpegStreamer streamer("", network_cfg.stream_port, 4);
+    WifiManager wifi;
+    http::JpegStreamer streamer("", STREAM_PORT, 4);
     err::check_raise(streamer.start(), "failed to start 15 FPS JPEG stream");
-    WebMonitor web(network_cfg.web_port, network_cfg.stream_port, recordings_dir,
+    WebMonitor web(WEB_PORT, STREAM_PORT, recordings_dir,
                    [&wifi]() { return wifi.web_status_json(); });
     AviMjpegWriter recorder;
     std::string recording_filename;
@@ -372,7 +372,6 @@ int app_main(int argc, char **argv) {
     const Button target_down{176, 202, 37, 34, "T-"};
     const Button target_up{216, 202, 37, 34, "T+"};
     const Button start_b{256, 202, 60, 34, "START"};
-    const Button wifi_b{196, 4, 58, 36, "WIFI"};
     const Button exit_b{258, 4, 58, 36, "EXIT"};
     BallMode mode = BallMode::CENTER_BALANCE;
     float target_cm = 0.0F;
@@ -417,10 +416,7 @@ int app_main(int argc, char **argv) {
             const int y = mapped.size() < 2 ? -1 : mapped[1];
             if (pressed && !prev_pressed) {
                 if (inside(exit_b, x, y)) break;
-                if (inside(wifi_b, x, y)) {
-                    wifi.request_reconnect();
-                    log::info("touch requested WiFi rescan/reconnect");
-                } else if (inside(cal_l, x, y) && ball_found) {
+                if (inside(cal_l, x, y) && ball_found) {
                     cfg.left_px = estimate.center; save_config(config_path, cfg);
                     log::info("captured %.1fcm point at (%.1f, %.1f)", cfg.left_cm,
                               cfg.left_px.x, cfg.left_px.y);
@@ -536,13 +532,11 @@ int app_main(int argc, char **argv) {
             draw_button(*frame, target_up, image::COLOR_BLUE);
             draw_button(*frame, start_b, mode == BallMode::THREE_POINT
                                             ? image::COLOR_GREEN : image::COLOR_GRAY);
-            draw_button(*frame, wifi_b, wifi.connected()
-                                            ? image::COLOR_GREEN : image::COLOR_ORANGE);
             draw_button(*frame, exit_b, image::COLOR_RED);
 
             // Display, browser stream and recording all consume this exact annotated frame.
             display.show(*frame);
-            std::unique_ptr<image::Image> jpeg(frame->to_jpeg(network_cfg.jpeg_quality));
+            std::unique_ptr<image::Image> jpeg(frame->to_jpeg(JPEG_QUALITY));
             if (jpeg) {
                 streamer.write(jpeg.get());
                 if (recorder.is_open()) {
